@@ -1,0 +1,575 @@
+---
+title: "Improved Partial Effects Plots for GAMs Looking at the Plankton Community"
+author: "Curtis C. Bohlen, Casco Bay Estuary Partnership"
+date: "7/21/2022"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    fig_width: 5
+    fig_height: 4
+---
+
+<img
+    src="https://www.cascobayestuary.org/wp-content/uploads/2014/04/logo_sm.jpg"
+    style="position:absolute;top:100px;right:50px;" />
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = 'center',
+                      fig.width = 5, fig.height = 4,
+                      collapse = TRUE, comment = "#>")
+```
+
+# Introduction
+This notebook reprises selected analyses using GAMs, and then develops nicer
+partial effects plots than the `mgcv` defaults.
+
+In particular, I'm interested in generating marginal plots as follows (the page
+numbers refer to where the "draft" marginal plots appear in the PDF of the 
+original analysis).
+
+1. Zoop density vs. Turbidity (pg. 20)
+2. Zoop diversity vs. Chl & Zoop diversity vs. Temp (combined 2-part figure), pg. 25
+3. Eurytemora density vs. Turbidity, pg. 34
+4. Barnacle vs. Chl & Barnacle vs. Temp (combined 2-part figure), pg. 31
+5. Acartia vs. Temp & Acartia vs. Salinity (combined 2-part figure), pg. 29
+
+# Load Libraries
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(mgcv)      # for GAM models
+library(ggeffects)
+library(gridExtra) # or could use related functions in `cowplot`
+```
+
+# Set Graphics Theme
+This sets `ggplot()`graphics for no background, no grid lines, etc. in a clean
+format suitable for (some) publications.
+
+```{r set_theme}
+theme_set(theme_classic())
+```
+
+# Input Data
+## Folder References
+```{r folder_refs}
+data_folder <- "Original_Data"
+
+dir.create(file.path(getwd(), 'figures'), showWarnings = FALSE)
+```
+
+## Load Data
+```{r load_enviro_data}
+filename.in <- "penob.station.data EA 3.12.20.xlsx"
+file_path <- file.path(data_folder, filename.in)
+station_data <- read_excel(file_path, 
+                           sheet="Final", col_types = c("skip", "date", 
+                                              "numeric", "text", "numeric", 
+                                              "text", "skip", "skip", 
+                                              "skip", 
+                                              rep("numeric", 10),
+                                              "text", 
+                                              rep("numeric", 47),
+                                              "text",
+                                              rep("numeric", 12))) %>%
+  rename_with(~ gsub(" ", "_", .x)) %>%
+  rename_with(~ gsub("\\.", "_", .x)) %>%
+  rename_with(~ gsub("\\?", "", .x)) %>%
+  rename_with(~ gsub("%", "pct", .x)) %>%
+  rename_with(~ gsub("_Abundance", "", .x)) %>%
+  filter(! is.na(date))
+```
+
+```{r}
+names(station_data)[10:12]
+names(station_data)[10:12] <- c('disch_wk', 'disch_day', 'disch_max')
+```
+
+Station names are arbitrary, and Erin previously expressed interest in renaming 
+them from Stations 2, 4, 5 and 8 to Stations 1,2,3,and 4.
+
+The `factor()` function by default sorts levels before assigning numeric codes,
+so a convenient way to replace the existing station codes with sequential
+numbers is to create a factor and extract the numeric indicator values with 
+`as.numeric()`.
+
+```{r change_station_names_2}
+station_data <- station_data %>%
+  mutate(station = factor(as.numeric(factor(station))))
+head(station_data)
+```
+
+### Subsetting to Desired Data Columns
+I base selection of predictor variables here on the ones used in the manuscript.
+
+```{r build_env_data}
+base_data <- station_data %>%
+  rename(Date = date, 
+         Station = station,
+         Year = year) %>%
+  select(-c(month, month_num)) %>%
+  mutate(Month = factor(as.numeric(format(Date, format = '%m')),
+                                                levels = 1:12, 
+                                                labels = month.abb),
+         DOY = as.numeric(format(Date,format = '%j')),
+         season = factor(season, levels = c('Spring', 'Summer', 'Fall')),
+         is_sp_up = season == 'Spring' & Station == 1,
+         Yearf = factor(Year)) %>%
+  rename(Season = season,
+         Density = combined_density,
+         Temp = ave_temp_c,
+         Sal = ave_sal_psu,
+         Turb = sur_turb,
+         AvgTurb = ave_turb_ntu,
+         DOsat = ave_DO_Saturation,
+         Chl = ave_chl_microgperl,
+         Fish = `___61`,
+         RH = Herring
+         ) %>%
+  select(Date, Station, Year, Yearf, Month, Season, is_sp_up, DOY, riv_km, 
+         disch_wk, disch_day, disch_max,
+         Temp, Sal, Turb, AvgTurb, DOsat, Chl, 
+         Fish, RH, 
+         Density, H, SEI,
+         Acartia, Balanus, Eurytemora, Polychaete, Pseudocal, Temora) %>%
+  arrange(Date, Station)
+head(base_data)
+```
+
+```{r}
+rm(station_data)
+```
+
+## Complete Cases
+This drops only two samples, one for missing Zooplankton data, one for missing
+fish data.  We need this reduced data set to run The `step()` function. It
+makes little sense to try stepwise model selection if each time you add or 
+remove a variable, the sample you are studying changes.  Since fish is never an
+important predictor, we will want need to refit models after stepwise elimination
+to use the most complete possible data set.
+
+```{r}
+complete_data <- base_data %>%
+  select(Season, Station, Yearf,
+         is_sp_up, Temp, Sal, Turb, Chl, Fish, RH,
+         Density, H, 
+         Acartia, Balanus, Eurytemora, Polychaete, Pseudocal, Temora) %>%
+  filter(complete.cases(.))
+```
+
+## Reduced Data
+The low salinity spring samples are doing something rather different, and they
+complicate model fitting. Models are far better behaved if we exclude a few
+extreme samples.  These are low salinity low zooplankton samples.  We have two 
+complementary ways to specify which samples to omit, without just omitting
+"outliers". The first is to restrict modeling to "marine" samples over a certain salinity, and the other is to omit spring upstream samples, which include most
+of the problematic samples.
+
+```{r}
+drop_low <- complete_data %>%
+  filter(Sal > 10)    # Pulls three samples, including one fall upstream sample
+                      # a fourth low salinity sample lacks zooplankton data
+#drop_sp_up <- complete_data %>%
+#  filter(! is_sp_up)  # drops four samples
+```
+
+
+# Total Zooplankton Density
+I fit the simplified model without Station.  The full model has the same
+concurvity problems as before, and here the model fails to converge.  While I
+could alter the convergence criteria to search for a solution, we know the model
+that includes Station will have concurvity problems, so there is little point.
+
+## Reduced Complexity Model
+```{r}
+density_gam_reduced<- gam(log(Density) ~ 
+                          #s(Temp, bs="ts", k = 5) +
+                          #s(Sal, bs="ts", k = 5) + 
+                          s(log(Turb), bs="ts", k = 5) + 
+                          s(log(Chl), bs="ts", k = 5) + 
+                          #s(log1p(Fish),bs="ts", k = 5) +
+                          s(Yearf, bs = 're'), 
+                        data = drop_low, family = 'gaussian')
+summary(density_gam_reduced)
+
+```
+
+```{r}
+oldpar <- par(mfrow = c(2,3))
+plot(density_gam_reduced)
+par(oldpar)
+```
+
+### Combined Graphic
+As far as I have been able to tell, you need to build up the combined plots for
+our mixed model GAMS piecewise.  The easiest way is to pull marginal means for
+each marginal predictor and then assemble them using `grid.arrange()` (for 
+display) or `arrangeGrob()` (for saving with `ggsave()`).
+
+```{r}
+ggp1 <- ggemmeans(density_gam_reduced, terms = 'Turb')
+ggp2 <- ggemmeans(density_gam_reduced, terms = 'Chl')
+```
+
+The instructions to authors suggests figure widths should line up with columns,
+and proposes figure widths should be: 
+
+39 mm   ~  1.54 inches
+84 mm   ~ 3.30 inches
+129 mm  ~ 5.04 inches
+174 mm  ~ 6.85 inches
+
+With height  not to exceed 235 mm (9.25 inches). 
+
+RMarkdown / `knitr` likes figure dimensions in inches. 174 mm is 
+about 6.85 inches
+
+```{r fig.height = 2.5, fig.width = 5}
+plt1 <- plot(ggp1, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  ggtitle('') +
+  xlab(expression("Turbidity" ~ "(NTU)")) +
+  scale_y_continuous( limits = c(0,9000), breaks = c(0, 2000, 4000, 6000, 8000))
+  
+plt2 <- plot(ggp2, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  xlab(expression("Chlorophyll (" * mu * g * L ^-1 ~")")) +
+  ggtitle('') +
+  scale_y_continuous( limits = c(0,9000), breaks = c(0, 2000, 4000, 6000, 8000))
+
+plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
+             ncol = 2, nrow = 1)
+#plt3
+```
+
+```{r}
+grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
+
+ggsave(file='figures/density.png', grphc, type='cairo',
+         width = 5, height = 2.5)
+ggsave('figures/density.pdf', grphc, device = cairo_pdf, 
+       width = 5, height = 2.5)
+```
+
+### Requested Graphic
+```{r fig.width = 3.3, fig.height  = 3.3}
+ggp <- ggemmeans(density_gam_reduced, terms = "Turb")
+plt <- plot(ggp, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  ggtitle('') +
+  xlab(expression("Turbidity" ~ "(NTU)")) +
+  scale_y_continuous( limits = c(0,9000), breaks = c(0, 2000, 4000, 6000, 8000))
+plt
+```
+
+```{r}
+ggsave('figures/density by turbidity.png', type='cairo',
+         width = 6.85, height = 4.9)
+ggsave('figures/density by turbidity.pdf', device = cairo_pdf, 
+       width = 6.85, height = 4.9)
+```
+
+# Shannon Diversity
+
+## Model on Reduced Data
+```{r}
+shannon_gam_no_low <- gam(H ~ 
+                     s(Temp, bs="ts", k = 5) +
+                     s(Sal, bs="ts", k = 5) + 
+                     s(log(Turb), bs="ts", k = 5) + 
+                     s(log(Chl), bs="ts", k = 5) + 
+                     s(log1p(Fish),bs="ts", k = 5) +
+                     s(Yearf, bs = 're'),
+                   data = drop_low, family = 'gaussian')
+summary(shannon_gam_no_low)
+```
+
+```{r}
+anova(shannon_gam_no_low)
+```
+
+### Plot the GAM
+```{r}
+oldpar <- par(mfrow = c(2,3))
+plot(shannon_gam_no_low)
+par(oldpar)
+```
+
+### Combined Graphic
+As far as I have been able to tell, you need to build up the combined plots for
+our mixed model GAMS piecewise.  The easiest way is to pull marginal means for
+each marginal predictor and then assemble them using `grid.arrange()` (for 
+display) or `arrangeGrob()` (for saving with `ggsave()`).
+
+```{r}
+ggp1 <- ggemmeans(shannon_gam_no_low, terms = 'Temp')
+ggp2 <- ggemmeans(shannon_gam_no_low, terms = 'Chl')
+```
+
+```{r fig.height = 2.5, fig.width = 5}
+plt1 <- plot(ggp1, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  ggtitle('') +
+  xlab(expression("Temperature (" * degree * "C)")) +
+  scale_y_continuous( limits = c(0,2.5), breaks = c(1:5*.5))
+  
+plt2 <- plot(ggp2, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  xlab(expression("Chlorophyll (" * mu * g * L ^-1 ~")")) +
+  ggtitle('') +
+  scale_y_continuous( limits = c(0,2.5), breaks = c(1:5*.5))
+
+plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
+             ncol = 2, nrow = 1)
+#plt3
+```
+
+```{r}
+grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
+
+ggsave(file='figures/shannon.png', grphc, type='cairo',
+         width = 5, height = 2.5)
+ggsave('figures/shannon.pdf', grphc, device = cairo_pdf, 
+       width = 5, height = 2.5)
+```
+
+# Single Species Models
+## Model Choice
+Our model alternatives are similar to the choices we had for the Total Density 
+model. The problem is, we can't use any of the continuous data distributions in 
+GAMS with zero values (at least relying on the canonical link functions) because
+(log(0) = -Inf; 1/0 = Inf, 1 / 0*0 = Inf). The easiest solution is to add some 
+finite small quantity to the density data, and predict that. Here we predict
+log(Density + 1) using Gaussian models.
+
+## Automating Analysis of Separate Species
+I'm going to automate analysis of all selected species by using a "nested"
+Tibble.  This is a convenient alternative to writing a "for" loop to run
+multiple identical analyses.
+
+I create a "long" data source, based on the reduced data set that omits low
+salinity samples.
+
+```{r}
+spp_data <- drop_low %>%
+  select(Yearf, Season, Station, Temp,
+          Sal, Turb, Chl, Fish, 
+          Acartia, Balanus, Eurytemora) %>%
+  pivot_longer(-c(Yearf:Fish), names_to = 'Species', values_to = 'Density')
+```
+
+Next, I create a function to run the analysis.  This function takes a data frame
+or tibble as an argument.  The tibble mush have data columns with the correct 
+names.
+
+The initial model fits for some species had a lot of wiggles in them, to an 
+extent that I thought did not make much scientific sense, so I decided to reduce
+the dimensionality of the GAM smoothers, by adding the parameter `k= 4`. Lowe
+numbers constrain the GAM to fit smoother lines.
+
+```{r}
+my_gam <- function(.dat) {
+  
+  gam(log1p(Density) ~ 
+        s(Temp, bs="ts", k = 5) +
+        s(Sal, bs="ts", k = 5) + 
+        s(log(Turb), bs="ts", k = 5) + 
+        s(log(Chl), bs="ts", k = 5) + 
+        s(log1p(Fish),bs="ts", k = 5) +
+        s(Yearf, bs = 're'),
+      data = .dat, family = "gaussian")
+}
+```
+
+Next, I create the nested tibble, and conduct the analysis on each species....
+
+```{r}
+spp_analysis <- spp_data %>%
+  group_by(Species) %>%
+  nest() %>%
+  mutate(gam_mods = map(data, my_gam))
+```
+
+And finally, output the model results.  I can do that in a "for" loop, but it's 
+Awkward to look through a long list of output, so I step through each species in turn.
+
+
+## Acartia
+```{r}
+spp = 'Acartia'
+mod <- spp_analysis$gam_mods[spp_analysis$Species == spp][[1]]
+summary(mod)
+```
+
+### Plot GAM
+```{r}
+oldpar <- par(mfrow = c(2,3))
+plot(mod)
+par(oldpar)
+```
+
+### Combined Graphic
+```{r}
+ggp1 <- ggemmeans(mod, terms = 'Temp')
+ggp2 <- ggemmeans(mod, terms = 'Sal')
+```
+#### Version 1
+```{r fig.height = 2.5, fig.width = 5}
+plt1 <- plot(ggp1, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  ggtitle('') +
+  xlab(expression("Temperature (" * degree * "C)")) +
+  ylab('Acartia Density') +
+  scale_y_continuous(breaks = c(1:5*2500)) +
+  coord_cartesian(ylim = c(0, 12500))
+  
+plt2 <- plot(ggp2, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  xlab(expression("Salinity" ~ "(PSU)")) +
+  ylab('Acartia Density') +
+  ggtitle('') +
+  scale_y_continuous(breaks = c(1:5*2500)) +
+  coord_cartesian(ylim = c(0, 12500))
+
+plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
+             ncol = 2, nrow = 1)
+#plt3
+```
+
+```{r}
+grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
+
+ggsave(file='figures/Acartia v1.png', grphc, type='cairo',
+         width = 5, height = 2.5)
+ggsave('figures/Acartia v1.pdf', grphc, device = cairo_pdf, 
+       width = 5, height = 2.5)
+```
+
+#### Version 2
+```{r fig.height = 2.5, fig.width = 5}
+plt1 <- plot(ggp1, add.data  = FALSE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  ggtitle('') +
+  xlab(expression("Temperature (" * degree * "C)")) +
+  ylab('Acartia Density')
+  
+plt2 <- plot(ggp2, add.data  = FALSE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  xlab(expression("Salinity" ~ "(PSU)")) +
+  ylab('Acartia Density') +
+  ggtitle('')
+
+plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
+             ncol = 2, nrow = 1)
+#plt3
+```
+
+```{r}
+grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
+
+ggsave(file='figures/Acartia v2.png', grphc, type='cairo',
+         width = 5, height = 2.5)
+ggsave('figures/Acartia v2.pdf', grphc, device = cairo_pdf, 
+       width = 5, height = 2.5)
+```
+
+## Balanus
+```{r}
+spp = 'Balanus'
+mod <- spp_analysis$gam_mods[spp_analysis$Species == spp][[1]]
+summary(mod)
+```
+
+### Plot GAM
+```{r}
+oldpar <- par(mfrow = c(2,3))
+plot(mod)
+par(oldpar)
+```
+### Combined Graphic
+```{r}
+ggp1 <- ggemmeans(mod, terms = 'Temp')
+ggp2 <- ggemmeans(mod, terms = 'Chl')
+```
+
+#### Version 1
+```{r fig.height = 2.5, fig.width = 5}
+plt1 <- plot(ggp1, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  ggtitle('') +
+  xlab(expression("Temperature (" * degree * "C)")) +
+  ylab('Balanus Density') +
+  scale_y_continuous(breaks = c(1:4*500)) +
+  coord_cartesian(ylim = c(0, 2000))
+  
+plt2 <- plot(ggp2, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  xlab(expression("Chlorophyll (" * mu * g * L ^-1 ~")")) +
+  ylab('Balanus Density') +
+  ggtitle('') +
+  scale_y_continuous(breaks = c(1:4*500)) +
+  coord_cartesian(ylim = c(0, 2000))
+
+plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
+             ncol = 2, nrow = 1)
+#plt3
+```
+
+```{r}
+grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
+
+ggsave(file='figures/Balanus v1.png', grphc, type='cairo',
+         width = 5, height = 2.5)
+ggsave('figures/Balanus v1.pdf', grphc, device = cairo_pdf, 
+       width = 5, height = 2.5)
+```
+
+
+##  Eurytemora
+```{r}
+spp =  "Eurytemora" 
+mod <- spp_analysis$gam_mods[spp_analysis$Species == spp][[1]]
+summary(mod)
+```
+
+### Plot GAM
+```{r}
+oldpar <- par(mfrow = c(2,3))
+plot(mod)
+par(oldpar)
+```
+### Requesed gRaphic
+```{r}
+ggp1 <- ggemmeans(mod, terms = 'Turb')
+```
+
+```{r fig.height = 3.3, fig.width = 3.3}
+plt1 <- plot(ggp1, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  ggtitle('') +
+  xlab(expression("Turbidity" ~ "(NTU)")) +
+  ylab('Eurytemora Density')
+plt1
+```
+
+```{r}
+ggsave(file='figures/Eurytemora.png', type='cairo',
+         width = 3.3, height = 3.3)
+ggsave('figures/Eurytemora.pdf', device = cairo_pdf, 
+       width = 3.3, height = 3.3)
+```
+
+
