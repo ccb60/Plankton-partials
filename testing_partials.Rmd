@@ -6,8 +6,7 @@ output: html_notebook
 # Introduction
 In this notebook, I explore various approaches to creating plots of the marginal
 effects of GAM models. I started with some simple internet searches, replicating 
-their mthods, and then explored some alternatives that came to light.
-
+their methods, and then explored some alternatives that came to light.
 
 # Load Packages
 ```{r}
@@ -24,7 +23,6 @@ format suitable for (some) publications.
 theme_set(theme_classic())
 ```
 
-
 # Part 1: Simple Residual Plot
 
 # Source
@@ -36,7 +34,7 @@ and especially
 I have translated those examples to `ggplot()` and the tidyverse, and followed
 my preferred coding style, which avoids the "T" pipe, and instead uses explicit 
 intermediate variables.  That makes it easier to annotate steps and explain the
-underlyng logic.
+underlying logic.
 
 # Load Data
 ```{r}
@@ -71,7 +69,7 @@ Here we calculate predicted values on a grid by temperature.  This allows us to
 draft a nice prediction plot, but so far it is not a partials plot.
 
 Note that by using `predict()` here, we are displaying conditional means, not 
-marginal means.  here that makes no difference, but it will matter with more'
+marginal means.  Here that makes no difference, but it will matter with other
 models.  An alternative is to use `emmeans()` to calculate predicted values 
 along the margin, and plot those.
 
@@ -87,7 +85,7 @@ p <- as_tibble(p) %>% mutate(temp = t$temp)
 rm(t)
 ```
 
-## Caclulating Marginal Residuals
+## Calculating Marginal Residuals
 We also need to generate the correct values for the background points. We
 calculate the points by providing the sum of predicted values based only on the
 `temp` term and adding the (working) residuals.  I also show the raw observations
@@ -123,7 +121,7 @@ plt
 ```
 
 The vertical label duplicates the convention in the `plot()` method for GAMs in
-`mgcv`.  THe numerical value is a measure of the total effective degrees of 
+`mgcv`.  The numerical value is a measure of the total effective degrees of 
 freedom of the GAM fit.  This is based on dropping the first smoothed term, 
 which is for the intercept, and summing the effective degrees of freedom for 
 each of the GAM spline terms.
@@ -143,7 +141,7 @@ Our actual use case is for generating multiple plots for the different
 predictors in a multi-variate GAM.  We need to develop this logic for when we
 have multiple predictors.
 
-Here we work it up just one more step of complexity, buy generating a model with
+Here we work it up just one more step of complexity, by generating a model with
 two predictors.
 
 ## A Naive Model
@@ -196,7 +194,7 @@ par(oldpar)
 ```
 
 We run into a few statistical issues if we simply follow the approach used
-before.  This is because it's not clear WHICH predicted values to plot on
+before. This is because it's not clear WHICH predicted values to plot on
 the Y axis of our plots. 
 
 The most obvious approach is to to do just what we did before, and plot 
@@ -268,7 +266,7 @@ p1.1 <- tibble( fit = p1$fit[1:l],
 ```
 
 Now find our background values, just like we did before.  Note that we have to
-select which predictor we want.  
+select which predictor we want.
 
 The way the `term` predictions are calculated, `pred` is a two column array. We
 want the first column which we access with a numeric index, rather than by name.
@@ -308,6 +306,10 @@ This is workable, but there are several problems with this approach.  First, we
 are using conditional means, not marginal means, and second, this will be
 awkward (although not impossible) to code for an arbitrary number of predictors.
 
+(Conditional means are conditioned on one specific value of other variables. 
+Marginal means average across all values of other variables, weighting by 
+relative abundance).
+
 # An Alternative, 
 Another approach is presented
 [here](https://stackoverflow.com/questions/59267259/emmeans-for-estimates-from-gams-for-plotting-and-inference-in-r)
@@ -324,7 +326,7 @@ conditioned over them).
 
 In its simplest form, usage is similar to `emmeans()`. Here I use
 `ggpredict()`, which duplicates the analysis we just managed by hand.  The
-`plot()` method has fairly intelligent defaults.  COntrol of the aesthetics is 
+`plot()` method has fairly intelligent defaults.  Control of the aesthetics is 
 some times awkward, but function parameters do give access to many plot details.
 Nevertheless, I found I needed to add the rug by hand, and I never found a way 
 to independently control the color of the background residual dots.
@@ -340,10 +342,10 @@ plt
 The plot() method has lots of customization options.  It generates a 
 `ggplot2` plot object. For more control,  we can construct the plot in 
 `ggplot()`, but it's not obvious how to add the  related points (raw data or 
-residuals) correctly to this plot. Those values need tobe generated "by hand" 
+residuals) correctly to this plot. Those values need to be generated "by hand" 
 from the underlying model, which is not readily available once I have built
-a new tibble for the predictions.  That is undoubtedly solvable, boy we don't
-need to do so, as we wil lsee in a moment.
+a new tibble for the predictions.  That is undoubtedly solvable, but we don't
+need to do so, as we will see in a moment.
 
 ```{r}
 ggplot(ggp, aes(x, predicted)) +
@@ -360,7 +362,7 @@ data frames, one for each predictor.
 ggp <- ggpredict(thegam2)
 ```
 
-The default `plot()` method handles this great when you =want to look at all of
+The default `plot()` method handles this great when you want to look at all of
 the predictors.
 
 ```{r error = TRUE}
@@ -371,9 +373,9 @@ plot(ggp, add.data = TRUE, facets = TRUE, colors = c('grey50', 'grey50'),
  ylab ('Effects')
 ```
 
-An alternative is to manually combine the data frames and them using ggplot and
-the `facet_wrap()` function.  However, as before, we lose information on  the 
-underlying model, making it more diffcult to also plot dat or residuals.
+An alternative is to manually combine the data frames and then use `ggplot` and
+the `facet_wrap()` function.  However, as before, we lose information on the 
+underlying model, making it more difficult to also plot data or residuals.
 
 ```{r}
 combodf <- map_df(ggp, bind_rows)
