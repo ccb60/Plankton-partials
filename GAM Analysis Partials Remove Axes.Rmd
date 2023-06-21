@@ -1,7 +1,7 @@
 ---
-title: "Improved Partial Effects Plots for GAMs Looking at the Plankton Community"
+title: "Further improvements to Partial Effects Plots"
 author: "Curtis C. Bohlen, Casco Bay Estuary Partnership"
-date: "7/21/2022"
+date: "6/21/2023"
 output:
   pdf_document:
     toc: true
@@ -22,31 +22,33 @@ knitr::opts_chunk$set(fig.align = 'center',
 
 # Introduction
 This notebook reprises selected analyses using GAMs, and then develops nicer
-partial effects plots than the `mgcv` defaults.
+partial effects plots than the `mgcv` defaults. In particular, I'm interested in generating plots of marginal means over data scatter plots. I focus only on 
+graphics that include two related plots of marginal means.
 
-In particular, I'm interested in generating marginal plots as follows (the page
-numbers refer to where the "draft" marginal plots appear in the PDF of the 
-original analysis).
+Rachel Lasley-Rasher requested that I assemble plots that lack repeated Y axes.
+It would probably be possible to construct them directly, assembling a graphic
+out of two `GROB`s containing graphs and a third containing the axis title and
+axis labels, but that would not be easy.
 
-1. Zoop density vs. Turbidity (pg. 20)
-2. Zoop diversity vs. Chl & Zoop diversity vs. Turbidity (combined 2-part figure), pg. 25
-3. Eurytemora density vs. Turbidity, pg. 34
-4. Barnacle vs. Chl & Barnacle vs. Temp (combined 2-part figure), pg. 31
-5. Acartia vs. Temp & Acartia vs. Salinity (combined 2-part figure), pg. 29
+## The Approach
+One alternative is to use `ggplot2`'s faceting capabilities. That is the
+approach I take here. The core idea is that you can assemble a couple of
+synthetic data frames (one for marginal means, one for raw data) and then
+produce faceted graphics.
 
-Rachel Lasley-Rasherhas requested that I assemble plots that lack repeated 
-y axes.  It is probably possible to construct them directly, 
-assembling a graphic out of two GROBs containing graphs and a third 
-containing the axis title nd axis labels, but that would not be easy.  
+## A couple of Challenges
+A few subtleties to make it all work:
 
-A possible alternative is to assemble artificial data frames specifically to
-facilitate use of `ggplot2`'s faceting capabilties.  That is the approach I take 
-here.
+1. The labels for the faceting factors most match in the two data frames and 
 
-The core idea is that you can assemble a couple of synthetic data frames (one
-for marginal means, one for raw data) to allow you to facet the resulting
-graphics, when you have multiple graphics. This function should not have to be
-changed, since you can facet the output of this function.
+2. Those labels may have to include expressions that `ggplot2` can parse to 
+   generate Greek letters, superscripts, etc. in the facet labels
+   
+3. Positioning of the facet labels is a bit tricky too.
+
+Unlike the "GAM Analysis Partials" notebook, here I don't rely on a function
+to generate the graphics in a consistent manner, but instead just work directly
+with `ggplot()`.
 
 # General Instructions to Authors About Graphics
 The instructions to authors suggests figure widths should line up with columns,
@@ -68,8 +70,8 @@ library(tidyverse)
 library(readxl)
 library(mgcv)      # for GAM models
 library(emmeans)
-library(ggeffects)
-library(gridExtra) # or could use related functions in `cowplot`
+#library(ggeffects)
+#library(gridExtra) # or could use related functions in `cowplot`
 ```
 
 # Set Graphics Theme
@@ -194,19 +196,16 @@ extreme samples.  These are low salinity low zooplankton samples.  We have two
 complementary ways to specify which samples to omit, without just omitting
 "outliers". The first is to restrict modeling to "marine" samples over a certain
 salinity range, and the other is to omit spring upstream samples, which include 
-most of the problematic samples.  We eventuaqlly decided to go with the first.
+most of the problematic samples.  We eventually decided to go with the first.
 
 ```{r}
 drop_low <- complete_data %>%
   filter(Sal > 10)    # Pulls three samples, including one fall upstream sample
                       # a fourth low salinity sample lacks zooplankton data
-#drop_sp_up <- complete_data %>%
-#  filter(! is_sp_up)  # drops four samples
 ```
 
-
-# Functions for Graphics Preparation
-I developed versions of these functions in the "GAM Analysis Partials.Rmd" 
+# Functions for Data Preparation
+I developed versions of these two functions in the "GAM Analysis Partials.Rmd" 
 notebook. See that notebook and the "Testing indirection.Rmd" notebook for more 
 of the logic involved.
 
@@ -271,36 +270,6 @@ marginal_analysis <- function(.dat, .predictor, .model,
 }
 ```
 
-
-## Construct a Plot
-This function does not handle axis labels (to simplify the code).
-
-
-```{r}
-marginal_plot <- function(.emms, .data, .predictor, .response, .panel = NULL) {
-  browser()
-  .predictor   <- ensym(.predictor)
-  .response    <- ensym(.response)
-  the_name     <- as.character(.predictor)
-  the_log_name <- paste0("log(", the_name, ")")
-  
-  xlocs <- .emms[[the_name]]
-  
-  #"response" is the default name of the output column in `emmeans()`
-  # lower.CL and # upper.CL are also default column names.
-  
-  ggplot(.emms, aes(xlocs, response)) +   
-    geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
-    geom_line() +
-    geom_point(data = .data, mapping = aes(x = !!.predictor, y = !!.response),
-             size = 1, color = "gray40") +
-    geom_rug(data = .data, mapping = aes(x = !!.predictor, y = NULL)) +
-    theme(axis.title = element_text(size = 9),
-          axis.text = element_text(size = 8))
-}
-```
-
-
 # Total Zooplankton Density
 I fit the simplified model without Station.  The full model has the same
 concurvity problems as before, and here the model fails to converge.  While I
@@ -320,22 +289,21 @@ density_gam_reduced<- gam(log(Density) ~
 summary(density_gam_reduced)
 
 ```
-
-## Generate Separate Marginal Means
+## Draft Graphic
+### Generate Separate Marginal Means
 ```{r}
 turb <- marginal_analysis(drop_low, Turb, density_gam_reduced, 
                                   .nstops = 25, .logx = TRUE)
-```
-
-```{r}
 chl <- marginal_analysis(drop_low, Chl, density_gam_reduced, 
                                   .nstops = 25, .logx = TRUE)
 ```
 
-## Combine Marginal Means Data
+### Combine Marginal Means Data
 Now, we need to assemble these into a single data frame, with appropriate
 labels to clarify which variable they represent.  Also the predictor variables
 have different names, so we need to harmonize them.
+
+### Name Match
 ```{r}
 names(turb) <- c("log(Pred)", names(turb)[2:6], "Pred")
 names(chl) <- c("log(Pred)", names(chl)[2:6], "Pred")
@@ -345,8 +313,8 @@ names(chl) <- c("log(Pred)", names(chl)[2:6], "Pred")
 emms <- bind_rows(Turbidity = turb, Chlorophyll = chl, .id = "source") 
 ```
 
-## Duplicate the Raw Data
-With appropriate names.
+### Duplicate the Raw Data
+The key point here is to add appropriate names that wil
 ```{r}
 dat <- drop_low %>%
   select(Turb, Chl, Density) %>%
@@ -354,6 +322,7 @@ dat <- drop_low %>%
   mutate(source = fct_recode(source, Turbidity = "Turb", Chlorophyll = "Chl"))
 ```
 
+### Draw the Graphic
 ```{r fig.width = 5, fig.height = 2.5}
 ggplot(emms, aes(Pred, response)) +   
   geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
@@ -372,9 +341,14 @@ ggplot(emms, aes(Pred, response)) +
   ylab("Density")
 ```
 
-Pretty close, but now we need to get the labels to show as fancy labels built
-up out of expressions.
+That's pretty close, but now we need to get the labels to show as fancy labels.
 
+## Final Graphic
+`ggplot2` allows you to construct fancier labels by building up something like
+plotmath expressions.  The syntax is a bit obscure, and as far as I can tell,
+you can only test whether you got it right by plotting the expression.
+
+## Organize the Data
 ```{r}
 fancy_turb <- expression("Turbidity" ~ "(NTU)")
 fancy_chl  <- expression("Chlorophyll ("* mu * g * L ^-1 ~")")
@@ -394,7 +368,8 @@ emms <- bind_rows(Turbidity = turb, Chlorophyll = chl, .id = "source")  %>%
 
 ```
 
-```{r fig.width = 5, fig.height = 2.5}
+### Draw the Graphic
+```{r fig.width = 5, fig.height = 2.2}
 ggplot(emms, aes(Pred, response)) +   
   geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
   geom_line() +
@@ -414,14 +389,13 @@ ggplot(emms, aes(Pred, response)) +
 
 ```
 
-## Save the Plot
+### Save the Plot
 ```{r}
 ggsave(file='figures/density_2.png',
 width = 5.04, height = 2.2)
 ggsave('figures/density_2.pdf', device = cairo_pdf,
 width = 5.04, height = 2.2)
 ```
-
 
 # Shannon Diversity
 ## Model on Reduced Data
@@ -436,14 +410,11 @@ shannon_gam_no_low <- gam(H ~
                    data = drop_low, family = 'gaussian')
 summary(shannon_gam_no_low)
 ```
-
+## Final Graphic
 ### Generate Separate Marginal Means
 ```{r}
 temp <- marginal_analysis(drop_low, Temp, shannon_gam_no_low, 
                                   .nstops = 25, .logx = FALSE)
-```
-
-```{r}
 chl <- marginal_analysis(drop_low, Chl, shannon_gam_no_low, 
                                   .nstops = 25, .logx = TRUE, .transy = FALSE)
 ```
@@ -454,6 +425,7 @@ names(temp) <- c("Pred", names(temp)[2:6])
 names(chl) <- c("log(Pred)", names(chl)[2:6], "Pred")
 chl <- chl[,c(7, 2:6)]
 ```
+
 ### Assemble data
 ```{r}
 fancy_temp <- expression("Temperature (" * degree * "C)")
@@ -469,8 +441,6 @@ emms <- bind_rows(Temperature = temp, Chlorophyll = chl, .id = "source")  %>%
   mutate(source = factor(source, 
                          levels = c("Temperature", "Chlorophyll"),
                          labels = c(fancy_temp, fancy_chl)))
-
-
 ```
 
 ### Generate Plot
@@ -494,6 +464,7 @@ ggplot(emms, aes(Pred, response)) +
 
 ```
 
+###Save the Plot
 ```{r}
 ggsave(file='figures/shannon_2.png',
          width = 5, height = 2.2)
@@ -569,8 +540,8 @@ dat <- spp_analysis$data[spp_analysis$Species == spp][[1]]
 summary(mod)
 ```
 
-### Combined Graphic
-### Generate Separate Marginal Means
+### Final Graphic
+#### Generate Separate Marginal Means
 ```{r}
 temp <- marginal_analysis(dat, Temp, mod, .logx = FALSE)
 ```
@@ -579,13 +550,13 @@ temp <- marginal_analysis(dat, Temp, mod, .logx = FALSE)
 sal <- marginal_analysis(dat, Sal, mod, .logx = FALSE)
 ```
 
-#### Name match
+##### Name match
 ```{r}
 names(temp) <- c("Pred", names(temp)[2:6])
 names(sal) <- c("Pred", names(sal)[2:6])
 ```
 
-### Assemble data
+#### Assemble data
 ```{r}
 fancy_temp <- expression("Temperature (" * degree * "C)")
 fancy_sal  <- expression("Salinity" ~ "(PSU)")
@@ -603,7 +574,7 @@ emms <- bind_rows(Temperature = temp, Salinity = sal, .id = "source")  %>%
                          labels = c(fancy_temp, fancy_sal)))
 ```
 
-### Generate Plot
+#### Generate Plot
 ```{r fig.width = 5, fig.height = 2.5}
 ggplot(emms, aes(Pred, response)) +   
   geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
@@ -626,7 +597,7 @@ ggplot(emms, aes(Pred, response)) +
 
 ```
 
-
+# Save Plot
 ```{r}
 ggsave(file='figures/Acartia_2.png', 
          width = 5.04, height = 2.5)
@@ -642,7 +613,8 @@ dat <- spp_analysis$data[spp_analysis$Species == spp][[1]]
 summary(mod)
 ```
 
-### Generate Separate Marginal Means
+### Final Graphic
+#### Generate Separate Marginal Means
 ```{r}
 temp <- marginal_analysis(dat, Temp, mod, .logx = FALSE)
 ```
@@ -651,14 +623,14 @@ temp <- marginal_analysis(dat, Temp, mod, .logx = FALSE)
 chl <- marginal_analysis(dat, Chl, mod, .logx = TRUE)
 ```
 
-#### Name match
+##### Name match
 ```{r}
 names(temp) <- c("Pred", names(temp)[2:6])
 names(chl) <- c("log(Pred)", names(chl)[2:6], "Pred")
 chl <- chl[,c(7, 2:6)]
 ```
 
-### Assemble data
+#### Assemble data
 ```{r}
 fancy_temp <- expression("Temperature (" * degree * "C)")
 fancy_chl  <- expression("Chlorophyll ("* mu * g * L ^-1 ~")")
@@ -676,7 +648,7 @@ emms <- bind_rows(Temperature = temp, Chlorophyll = chl, .id = "source")  %>%
                          labels = c(fancy_temp, fancy_chl)))
 ```
 
-### Generate Plot
+#### Generate Plot
 ```{r fig.width = 5, fig.height = 2.5}
 ggplot(emms, aes(Pred, response)) +   
   geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
@@ -698,6 +670,7 @@ ggplot(emms, aes(Pred, response)) +
   coord_cartesian(ylim = c(0, 2000))
 ```
 
+#### Save Plot
 ```{r}
 ggsave(file='figures/Balanus_2.png',
          width = 5.04, height = 2.5)
