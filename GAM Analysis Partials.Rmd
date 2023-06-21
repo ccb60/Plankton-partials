@@ -7,7 +7,7 @@ output:
     toc: true
     toc_depth: 2
     fig_width: 5
-    fig_height: 4
+    fig_height: 3
 ---
 
 <img
@@ -16,7 +16,7 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(fig.align = 'center',
-                      fig.width = 5, fig.height = 4,
+                      fig.width = 5, fig.height = 3,
                       collapse = TRUE, comment = "#>")
 ```
 
@@ -39,6 +39,7 @@ original analysis).
 library(tidyverse)
 library(readxl)
 library(mgcv)      # for GAM models
+library(emmeans)
 library(ggeffects)
 library(gridExtra) # or could use related functions in `cowplot`
 ```
@@ -163,8 +164,9 @@ The low salinity spring samples are doing something rather different, and they
 complicate model fitting. Models are far better behaved if we exclude a few
 extreme samples.  These are low salinity low zooplankton samples.  We have two 
 complementary ways to specify which samples to omit, without just omitting
-"outliers". The first is to restrict modeling to "marine" samples over a certain salinity, and the other is to omit spring upstream samples, which include most
-of the problematic samples.
+"outliers". The first is to restrict modeling to "marine" samples over a certain
+salinity range, and the other is to omit spring upstream samples, which include 
+most of the problematic samples.  We eventuaqlly decided to go with the first.
 
 ```{r}
 drop_low <- complete_data %>%
@@ -173,7 +175,6 @@ drop_low <- complete_data %>%
 #drop_sp_up <- complete_data %>%
 #  filter(! is_sp_up)  # drops four samples
 ```
-
 
 # Total Zooplankton Density
 I fit the simplified model without Station.  The full model has the same
@@ -201,17 +202,186 @@ plot(density_gam_reduced)
 par(oldpar)
 ```
 
-### Combined Graphic
+### Combined Graphic now Fails
 As far as I have been able to tell, you need to build up the combined plots for
 our mixed model GAMS piecewise.  The easiest way is to pull marginal means for
 each marginal predictor and then assemble them using `grid.arrange()` (for 
 display) or `arrangeGrob()` (for saving with `ggsave()`).
 
-```{r}
+# Changes in `ggemmeans()` Function Require a New Approach
+```{r  error = TRUE}
 ggp1 <- ggemmeans(density_gam_reduced, terms = 'Turb')
 ggp2 <- ggemmeans(density_gam_reduced, terms = 'Chl')
 ```
+I'm not sure why that error is popping up. That used to work, as documented in
+the version of the Notebook saved in November of 2022.  Chances are, there has
+been a change in how either `ggemmeans()` or `emmeans()` itself handles names.
+This does not affect code in the "testing partials.Rmd" notebook, so the effect
+probably relates to transformed predictor variables, possibly only in the
+context of GAMs.
 
+## `ggpredict()` does not do what we want
+We'll first take the advice in the warnings and try using `ggpredict()`, but it
+does not work all that well. `ggpredict()` produces conditional means, not
+marginal means. The result is that regardless of the year chosen, the data do
+not line up all that well with the (multi-year) raw data. Perhaps the best
+apparent fit is for 2016.
+
+```{r}
+ggp1 <- ggpredict(density_gam_reduced, terms = 'Turb', 
+                  condition = c(Yearf = 2016))
+ggp1
+```
+
+```{r fig.width = 5, fig.height = 3}
+plot(ggp1, add.data  = TRUE, 
+     dot.alpha = 0.5, dot.size = 1) +
+  geom_rug(aes(y = NULL)) +
+  ggtitle('') +
+  xlab(expression("Turbidity" ~ "(NTU)"))# +
+ # scale_y_continuous( limits = c(0,9000), breaks = c(0, 2000, 4000, 6000, 8000))
+```
+
+At first blush that looks like it worked, but the data do not line up well with
+the (conditional) predictions. And the arbitrary selection of 2016 as the
+reference year here is *ad hoc*.  It would be far better to use `emmeans` or
+`effects` to produce marginal means.  Unfortunately, `effects' does no know how
+to handle GAM models, so we need to use `emmeans`.
+
+## Generating a similar graphic "by hand"
+I can "roll my own" by calling `emmeans` directly. The following works if I am
+explicit about the log term in the call.  I believe that is a new wrinkle, and
+probably explains why the call to `ggemmeans()` no longer works. I used to be
+able to call emmeans only referring to "Turb", not "log(Turb)".
+
+First, we calculate 25 points for predictions.
+```{r}
+r <- range(drop_low$Turb)
+stops = seq(r[1], r[2], length.out = 25)
+```
+
+```{r}
+test <- emmeans(density_gam_reduced, 'log(Turb)', 
+                        at = list(`log(Turb)` = log(stops), 'Yearf' = 2015, Chl = 3.86),
+                        type = 'response')
+test <- as_tibble(test) %>%
+  mutate(Turb = exp(`log(Turb)`)) %>%
+  relocate(Turb)
+test
+```
+
+```{r fig.width = 5, fig.height = 3}
+ggplot(test, aes(Turb, response)) +
+  geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), alpha = 0.20) +
+  geom_line() +
+  #geom_point() +
+  geom_point(data = drop_low, mapping = aes(x = Turb, y = Density), 
+             size = 1, color = "gray40") +
+  geom_rug(data = drop_low, mapping = aes(x = Turb, y = NULL)) +
+  xlab(expression("Turbidity" ~ "(NTU)")) +
+  ylab(expression("Zooplankton Density (" * m ^-3 ~ ")" ))
+```
+
+Note that this graphic is simpler than the one produced by `ggpredict()`
+(and `ggeffects()` or `ggemmeans()`). In particular, it does not have the grid
+in back of the figure.
+
+## Functions to capture that logic
+### Find Evenly Spaced Points
+```{r}
+find_stops <- function(.dat, .predictor, .nstops = 25) {
+  .predictor <- ensym(.predictor)
+  r <- range(.dat[[.predictor]])
+  stops = seq(r[1], r[2], length.out = .nstops)
+  
+  return(stops)
+}
+```
+
+### Conduct The Analysis
+```{r}
+marginal_analysis <- function(.dat, .predictor, .model, 
+                              .nstops = 25, .logx = TRUE, .transy = TRUE) {
+  .predictor <- ensym(.predictor)
+  
+  the_name <- as.character(.predictor)
+  the_log_name <- paste0("log(", the_name, ")")
+  
+  # The following finds stops linear in the original predictor scale.
+  # That is appropriate for the planned graphics, where both axes are 
+  # untransformed.
+  stops <- find_stops(.dat, !!.predictor, .nstops)
+  # browser()
+  if (.logx) {
+    stopslist <- list(log(stops))
+    names(stopslist) <- the_log_name
+    
+    emms <- emmeans(.model, the_log_name, 
+                    at = stopslist,
+                    type = 'response')
+    emms <- as_tibble(emms) 
+    #browser()
+    emms <- emms %>%
+      mutate( !!the_name := exp(emms[[the_log_name]]))
+  }
+  else {
+    #browser()
+    stopslist <- list(stops)
+    names(stopslist) <- the_name
+    
+    emms <- emmeans(.model, the_name, 
+                    at = stopslist,
+                    type = 'response')
+    emms <- as_tibble(emms)
+    
+  }
+  #The default name of the output of emmeans() differs if the response
+  #variable is transformed or untransformed. This makes it consistent.
+  if (! .transy) {
+    emms <-  emms %>%
+      rename(response = emmean)
+  }
+  return(emms)
+}
+```
+
+```{r}
+a <- marginal_analysis(drop_low, Turb,  
+                           .model = density_gam_reduced)
+```
+
+### Construct a Plot
+This function does not handle axis labels (to simplify the code).
+```{r}
+marginal_plot <- function(.emms, .data, .predictor, .response) {
+  #browser()
+  .predictor   <- ensym(.predictor)
+  .response    <- ensym(.response)
+  the_name     <- as.character(.predictor)
+  the_log_name <- paste0("log(", the_name, ")")
+  
+  xlocs <- .emms[[the_name]]
+  
+  #"response" is the default name of the output column in `emmeans()`
+  # lower.CL and # upper.CL are also default column names.
+  
+  ggplot(.emms, aes(xlocs, response)) +   
+    geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
+    geom_line() +
+    geom_point(data = .data, mapping = aes(x = !!.predictor, y = !!.response),
+             size = 1, color = "gray40") +
+    geom_rug(data = .data, mapping = aes(x = !!.predictor, y = NULL)) +
+    theme(axis.title = element_text(size = 9),
+          axis.text = element_text(size = 8))
+}
+```
+
+```{r}
+marginal_plot(a, drop_low, Turb, Density)
+```
+ 
+# Return to generating the Plots for Total Zooplankton Density
+## General Instructions to Authors About Graphics
 The instructions to authors suggests figure widths should line up with columns,
 and proposes figure widths should be: 
 
@@ -225,56 +395,54 @@ With height  not to exceed 235 mm (9.25 inches).
 RMarkdown / `knitr` likes figure dimensions in inches. 174 mm is 
 about 6.85 inches
 
-```{r fig.height = 2.5, fig.width = 5}
-plt1 <- plot(ggp1, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  ggtitle('') +
+## Generate Graphics
+```{r}
+ggp1_dat <- marginal_analysis(drop_low, Turb, density_gam_reduced, 
+                                  .nstops = 25, .logx = TRUE)
+ggp2_dat <- marginal_analysis(drop_low, Chl, density_gam_reduced, 
+                                  .nstops = 25, .logx = TRUE)
+```
+
+
+```{r}
+plt1 <- marginal_plot(ggp1_dat, drop_low, Turb, Density) +
   xlab(expression("Turbidity" ~ "(NTU)")) +
-  scale_y_continuous( limits = c(0,9000), breaks = c(0, 2000, 4000, 6000, 8000))
-  
-plt2 <- plot(ggp2, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
+  ylab(expression("Zooplankton Density (" * m ^-3 ~ ")" ))
+```
+
+```{r}
+plt2 <- marginal_plot(ggp2_dat, drop_low, Chl, Density) +
   xlab(expression("Chlorophyll (" * mu * g * L ^-1 ~")")) +
-  ggtitle('') +
-  scale_y_continuous( limits = c(0,9000), breaks = c(0, 2000, 4000, 6000, 8000))
-
-plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
-             ncol = 2, nrow = 1)
-#plt3
+  ylab(expression("Zooplankton Density (" * m ^-3 ~ ")" ))
 ```
 
+## Assemble a multi-panel plot
+This automatically generates output.  If you save output to a variable, the 
+result is a `gtable`, not a simple plot. Some functions know what to do with
+that, others don't.
+```{r fig.width = 5.04, fig.height = 2.2}
+grphc <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other packages,
+ncol = 2, nrow = 1)
+```
+
+## Save the Plot
 ```{r}
-grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
-
-ggsave(file='figures/density.png', grphc, type='cairo',
-         width = 5, height = 2.5)
-ggsave('figures/density.pdf', grphc, device = cairo_pdf, 
-       width = 5, height = 2.5)
+ggsave(file='figures/density.png', grphc,
+width = 5.04, height = 2.2)
+ggsave('figures/density.pdf', grphc, device = cairo_pdf,
+width = 5.04, height = 2.2)
 ```
 
-### Requested Graphic
-```{r fig.width = 3.3, fig.height  = 3.3}
-ggp <- ggemmeans(density_gam_reduced, terms = "Turb")
-plt <- plot(ggp, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  ggtitle('') +
-  xlab(expression("Turbidity" ~ "(NTU)")) +
-  scale_y_continuous( limits = c(0,9000), breaks = c(0, 2000, 4000, 6000, 8000))
-plt
-```
-
+## Requested Graphic
+Here I save only `plt1`.
 ```{r}
-ggsave('figures/density by turbidity.png', type='cairo',
-         width = 6.85, height = 4.9)
-ggsave('figures/density by turbidity.pdf', device = cairo_pdf, 
-       width = 6.85, height = 4.9)
+ggsave('figures/density by turbidity.png', plt1,
+         width = 3.30, height = 2.2)
+ggsave('figures/density by turbidity.pdf', plt1, device = cairo_pdf, 
+       width = 3.30, height = 2.2)
 ```
 
 # Shannon Diversity
-
 ## Model on Reduced Data
 ```{r}
 shannon_gam_no_low <- gam(H ~ 
@@ -300,43 +468,48 @@ par(oldpar)
 ```
 
 ### Combined Graphic
-As far as I have been able to tell, you need to build up the combined plots for
-our mixed model GAMS piecewise.  The easiest way is to pull marginal means for
-each marginal predictor and then assemble them using `grid.arrange()` (for 
-display) or `arrangeGrob()` (for saving with `ggsave()`).
-
 ```{r}
-ggp1 <- ggemmeans(shannon_gam_no_low, terms = 'Temp')
-ggp2 <- ggemmeans(shannon_gam_no_low, terms = 'Chl')
+ggp1_dat <- marginal_analysis(drop_low, Temp, shannon_gam_no_low, 
+                              .nstops = 25, 
+                              .logx = FALSE, .transy = FALSE)
 ```
 
-```{r fig.height = 2.5, fig.width = 5}
-plt1 <- plot(ggp1, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  ggtitle('') +
+```{r}
+ggp2_dat <- marginal_analysis(drop_low, Chl, shannon_gam_no_low, 
+                              .nstops = 25, 
+                              .logx = TRUE,  .transy = FALSE)
+```
+
+.emms, .data, .predictor, .response
+```{r fig.width = 3, fig.height = 2}
+plt1 <- marginal_plot(ggp1_dat, drop_low, Temp, H ) +
   xlab(expression("Temperature (" * degree * "C)")) +
-  scale_y_continuous( limits = c(0,2.5), breaks = c(1:5*.5))
-  
-plt2 <- plot(ggp2, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  xlab(expression("Chlorophyll (" * mu * g * L ^-1 ~")")) +
-  ggtitle('') +
-  scale_y_continuous( limits = c(0,2.5), breaks = c(1:5*.5))
+  ylab("Diversity(H)")+
+  scale_y_continuous(breaks = c(0:2)) +
+  coord_cartesian(ylim = c(0, 2.5))
+plt1
+```
 
-plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
-             ncol = 2, nrow = 1)
-#plt3
+```{r fig.width = 3, fig.height = 2}
+plt2 <- marginal_plot(ggp2_dat, drop_low, Chl, H) +
+  xlab(expression("Chlorophyll (" * mu * g * L ^-1 ~")")) +
+  ylab("Diversity(H)")+
+  scale_y_continuous(breaks = c(0:2)) +
+  coord_cartesian(ylim = c(0, 2.5))
+plt2
+```
+
+## Assemble a multi-panel plot
+```{r fig.width = 5, fig.height = 2.2}
+grphc <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other packages,
+ncol = 2, nrow = 1)
 ```
 
 ```{r}
-grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
-
-ggsave(file='figures/shannon.png', grphc, type='cairo',
-         width = 5, height = 2.5)
+ggsave(file='figures/shannon.png', grphc,
+         width = 5, height = 2.2)
 ggsave('figures/shannon.pdf', grphc, device = cairo_pdf, 
-       width = 5, height = 2.5)
+       width = 5, height = 2.2)
 ```
 
 # Single Species Models
@@ -399,11 +572,11 @@ spp_analysis <- spp_data %>%
 And finally, output the model results.  I can do that in a "for" loop, but it's 
 Awkward to look through a long list of output, so I step through each species in turn.
 
-
 ## Acartia
 ```{r}
 spp = 'Acartia'
 mod <- spp_analysis$gam_mods[spp_analysis$Species == spp][[1]]
+dat <- spp_analysis$data[spp_analysis$Species == spp][[1]]
 summary(mod)
 ```
 
@@ -416,77 +589,55 @@ par(oldpar)
 
 ### Combined Graphic
 ```{r}
-ggp1 <- ggemmeans(mod, terms = 'Temp')
-ggp2 <- ggemmeans(mod, terms = 'Sal')
+ggp1_dat <- marginal_analysis(dat, Temp, mod, 
+                                  .nstops = 25, .logx = FALSE)
+
+ggp2_dat <- marginal_analysis(dat, Sal, mod, 
+                                  .nstops = 25, .logx = FALSE)
 ```
-#### Version 1
-```{r fig.height = 2.5, fig.width = 5}
-plt1 <- plot(ggp1, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  ggtitle('') +
+
+```{r fig.width = 3, fig.height = 2}
+plt1 <- marginal_plot(ggp1_dat, dat, Temp, Density) +
   xlab(expression("Temperature (" * degree * "C)")) +
-  ylab('Acartia Density') +
+  ylab(expression("Acartia Density (" * m ^-3 ~ ")" ))
+plt1
+```
+
+```{r fig.width = 3, fig.height = 2}
+plt2 <- marginal_plot(ggp2_dat, dat, Sal, Density) +
+  xlab(expression("Salinity" ~ "(PSU)")) +
+  ylab(expression("Acartia Density (" * m ^-3 ~ ")" ))
+plt2
+```
+
+#### Assemble a multi-panel plot
+##### Adjust Vertical Axis so They Match
+```{r fig.height = 2.5, fig.width = 5}
+plt1 <- plt1 +
   scale_y_continuous(breaks = c(1:5*2500)) +
   coord_cartesian(ylim = c(0, 12500))
   
-plt2 <- plot(ggp2, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  xlab(expression("Salinity" ~ "(PSU)")) +
-  ylab('Acartia Density') +
-  ggtitle('') +
+plt2 <- plt2 +
   scale_y_continuous(breaks = c(1:5*2500)) +
   coord_cartesian(ylim = c(0, 12500))
-
-plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
-             ncol = 2, nrow = 1)
-#plt3
 ```
 
 ```{r}
 grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
-
-ggsave(file='figures/Acartia v1.png', grphc, type='cairo',
-         width = 5, height = 2.5)
-ggsave('figures/Acartia v1.pdf', grphc, device = cairo_pdf, 
-       width = 5, height = 2.5)
-```
-
-#### Version 2
-```{r fig.height = 2.5, fig.width = 5}
-plt1 <- plot(ggp1, add.data  = FALSE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  ggtitle('') +
-  xlab(expression("Temperature (" * degree * "C)")) +
-  ylab('Acartia Density')
-  
-plt2 <- plot(ggp2, add.data  = FALSE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  xlab(expression("Salinity" ~ "(PSU)")) +
-  ylab('Acartia Density') +
-  ggtitle('')
-
-plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
-             ncol = 2, nrow = 1)
-#plt3
 ```
 
 ```{r}
-grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
-
-ggsave(file='figures/Acartia v2.png', grphc, type='cairo',
-         width = 5, height = 2.5)
-ggsave('figures/Acartia v2.pdf', grphc, device = cairo_pdf, 
-       width = 5, height = 2.5)
+ggsave(file='figures/Acartia.png', grphc,
+         width = 5.04, height = 2.5)
+ggsave('figures/Acartia.pdf', grphc, device = cairo_pdf, 
+       width = 5.04, height = 2.5)
 ```
 
 ## Balanus
 ```{r}
 spp = 'Balanus'
 mod <- spp_analysis$gam_mods[spp_analysis$Species == spp][[1]]
+dat <- spp_analysis$data[spp_analysis$Species == spp][[1]]
 summary(mod)
 ```
 
@@ -496,51 +647,61 @@ oldpar <- par(mfrow = c(2,3))
 plot(mod)
 par(oldpar)
 ```
+
 ### Combined Graphic
 ```{r}
-ggp1 <- ggemmeans(mod, terms = 'Temp')
-ggp2 <- ggemmeans(mod, terms = 'Chl')
+ggp1_dat <- marginal_analysis(dat, Temp, mod, 
+                                      .nstops = 25,
+                                      .logx = FALSE)
 ```
 
-#### Version 1
-```{r fig.height = 2.5, fig.width = 5}
-plt1 <- plot(ggp1, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  ggtitle('') +
-  xlab(expression("Temperature (" * degree * "C)")) +
-  ylab('Balanus Density') +
-  scale_y_continuous(breaks = c(1:4*500)) +
-  coord_cartesian(ylim = c(0, 2000))
-  
-plt2 <- plot(ggp2, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  xlab(expression("Chlorophyll (" * mu * g * L ^-1 ~")")) +
-  ylab('Balanus Density') +
-  ggtitle('') +
-  scale_y_continuous(breaks = c(1:4*500)) +
-  coord_cartesian(ylim = c(0, 2000))
+```{r}
+ggp2_dat <- marginal_analysis(dat, Chl, mod, 
+                              .nstops = 25,
+                              .logx = TRUE)
+```
 
-plt3 <- grid.arrange(plt1, plt2, # alternatives here from cowplot and other pacj=hages,
-             ncol = 2, nrow = 1)
-#plt3
+```{r fig.width = 3, fig.height = 2}
+plt1 <- marginal_plot(ggp1_dat, dat, Temp, Density) +
+  xlab(expression("Temperature (" * degree * "C)")) +
+  ylab(expression("Balanus Density (" * m ^-3 ~ ")" )) 
+
+plt1
+```
+
+```{r fig.width = 3, fig.height = 2}
+plt2 <- marginal_plot(ggp2_dat, dat, Chl, Density) +
+  xlab(expression("Chlorophyll (" * mu * g * L ^-1 ~")")) +
+  ylab(expression("Balanus Density (" * m ^-3 ~ ")" ))
+plt2
+```
+
+#### Assemble a multi-panel plot
+##### Adjust Vertical Axis so They Match
+```{r fig.height = 2.5, fig.width = 5}
+plt1 <- plt1 +
+  scale_y_continuous(breaks = c(0:3*500)) +
+  coord_cartesian(ylim = c(0, 1600))
+  
+plt2 <- plt2 +
+  scale_y_continuous(breaks = c(0:3*500)) +
+  coord_cartesian(ylim = c(0, 1600))
 ```
 
 ```{r}
 grphc <- arrangeGrob(plt1, plt2, ncol = 2, nrow = 1) #generates graphic
 
-ggsave(file='figures/Balanus v1.png', grphc, type='cairo',
-         width = 5, height = 2.5)
-ggsave('figures/Balanus v1.pdf', grphc, device = cairo_pdf, 
-       width = 5, height = 2.5)
+ggsave(file='figures/Balanus.png', grphc,
+         width = 5.04, height = 2.5)
+ggsave('figures/Balanus.pdf', grphc, device = cairo_pdf, 
+       width = 5.05, height = 2.5)
 ```
-
 
 ##  Eurytemora
 ```{r}
 spp =  "Eurytemora" 
 mod <- spp_analysis$gam_mods[spp_analysis$Species == spp][[1]]
+dat <- spp_analysis$data[spp_analysis$Species == spp][[1]]
 summary(mod)
 ```
 
@@ -550,23 +711,30 @@ oldpar <- par(mfrow = c(2,3))
 plot(mod)
 par(oldpar)
 ```
-### Requesed gRaphic
+
+### Requesed Graphic
 ```{r}
-ggp1 <- ggemmeans(mod, terms = 'Turb')
+ggp1_dat <- marginal_analysis(dat, Turb, mod, 
+                                  .nstops = 25, .logx = TRUE)
 ```
 
-```{r fig.height = 3.3, fig.width = 3.3}
-plt1 <- plot(ggp1, add.data  = TRUE, 
-     dot.alpha = 0.5, dot.size = 1) +
-  geom_rug(aes(y = NULL)) +
-  ggtitle('') +
+```{r fig.width = 3, fig.height = 2}
+plt1 <- marginal_plot(ggp1_dat, dat, Turb, Density) +
   xlab(expression("Turbidity" ~ "(NTU)")) +
-  ylab('Eurytemora Density')
+  ylab(expression("Eurytemora Density (" * m ^-3 ~ ")" ))
+plt1
+```
+
+
+```{r fig.height = 3.3, fig.width = 3.3}
+plt1 <- plt1 + 
+  xlab(expression("Turbidity" ~ "(NTU)")) +
+  ylab(expression("Eurytemora Density (" * m ^-3 ~ ")" ))
 plt1
 ```
 
 ```{r}
-ggsave(file='figures/Eurytemora.png', type='cairo',
+ggsave(file='figures/Eurytemora.png',
          width = 3.3, height = 3.3)
 ggsave('figures/Eurytemora.pdf', device = cairo_pdf, 
        width = 3.3, height = 3.3)
