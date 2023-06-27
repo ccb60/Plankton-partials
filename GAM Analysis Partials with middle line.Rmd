@@ -1,0 +1,647 @@
+---
+title: "Further improvements to Partial Effects Plots"
+author: "Curtis C. Bohlen, Casco Bay Estuary Partnership"
+date: "6/21/2023"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    fig_width: 5
+    fig_height: 3
+---
+
+<img
+    src="https://www.cascobayestuary.org/wp-content/uploads/2014/04/logo_sm.jpg"
+    style="position:absolute;top:100px;right:50px;" />
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = 'center',
+                      fig.width = 5, fig.height = 3,
+                      collapse = TRUE, comment = "#>")
+```
+
+# Introduction
+This notebook reprises selected analyses using GAMs, and then develops nicer
+partial effects plots than the `mgcv` defaults. In particular, I'm interested in generating plots of marginal means over data scatter plots. I focus only on 
+graphics that include two related plots of marginal means.
+
+Rachel Lasley-Rasher requested that I assemble plots that lack repeated Y axes.
+It would probably be possible to construct them directly, assembling a graphic
+out of two `GROB`s containing graphs and a third containing the axis title and
+axis labels, but that would not be easy.
+
+## The Approach
+One alternative is to use `ggplot2`'s faceting capabilities. That is the
+approach I take here. The core idea is that you can assemble a couple of
+synthetic data frames (one for marginal means, one for raw data) and then
+produce faceted graphics.
+
+## A couple of Challenges
+A few subtleties to make it all work:
+
+1. The labels for the faceting factors most match in the two data frames and 
+
+2. Those labels may have to include expressions that `ggplot2` can parse to 
+   generate Greek letters, superscripts, etc. in the facet labels
+   
+3. Positioning of the facet labels is a bit tricky too.
+
+Unlike the "GAM Analysis Partials" notebook, here I don't rely on a function
+to generate the graphics in a consistent manner, but instead just work directly
+with `ggplot()`.
+
+# General Instructions to Authors About Graphics
+The instructions to authors suggests figure widths should line up with columns,
+and proposes figure widths should be: 
+
+39 mm   ~  1.54 inches
+84 mm   ~ 3.30 inches
+129 mm  ~ 5.04 inches
+174 mm  ~ 6.85 inches
+
+With height  not to exceed 235 mm (9.25 inches). 
+
+RMarkdown / `knitr` likes figure dimensions in inches. 174 mm is 
+about 6.85 inches
+
+# Load Libraries
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(mgcv)      # for GAM models
+library(emmeans)
+library(lemon)
+```
+
+# Set Graphics Theme
+This sets `ggplot()`graphics for no background, no grid lines, etc. in a clean
+format suitable for (some) publications.
+
+```{r set_theme}
+theme_set(theme_classic())
+```
+
+# Input Data
+## Folder References
+```{r folder_refs}
+data_folder <- "Original_Data"
+
+dir.create(file.path(getwd(), 'figures'), showWarnings = FALSE)
+```
+
+## Load Data
+```{r load_enviro_data}
+filename.in <- "penob.station.data EA 3.12.20.xlsx"
+file_path <- file.path(data_folder, filename.in)
+station_data <- read_excel(file_path, 
+                           sheet="Final", col_types = c("skip", "date", 
+                                              "numeric", "text", "numeric", 
+                                              "text", "skip", "skip", 
+                                              "skip", 
+                                              rep("numeric", 10),
+                                              "text", 
+                                              rep("numeric", 47),
+                                              "text",
+                                              rep("numeric", 12))) %>%
+  rename_with(~ gsub(" ", "_", .x)) %>%
+  rename_with(~ gsub("\\.", "_", .x)) %>%
+  rename_with(~ gsub("\\?", "", .x)) %>%
+  rename_with(~ gsub("%", "pct", .x)) %>%
+  rename_with(~ gsub("_Abundance", "", .x)) %>%
+  filter(! is.na(date))
+```
+
+```{r}
+names(station_data)[10:12]
+names(station_data)[10:12] <- c('disch_wk', 'disch_day', 'disch_max')
+```
+
+Station names are arbitrary, and Erin previously expressed interest in renaming 
+them from Stations 2, 4, 5 and 8 to Stations 1,2,3,and 4.
+
+The `factor()` function by default sorts levels before assigning numeric codes,
+so a convenient way to replace the existing station codes with sequential
+numbers is to create a factor and extract the numeric indicator values with 
+`as.numeric()`.
+
+```{r change_station_names_2}
+station_data <- station_data %>%
+  mutate(station = factor(as.numeric(factor(station))))
+head(station_data)
+```
+
+### Subsetting to Desired Data Columns
+I base selection of predictor variables here on the ones used in the manuscript.
+
+```{r build_env_data}
+base_data <- station_data %>%
+  rename(Date = date, 
+         Station = station,
+         Year = year) %>%
+  select(-c(month, month_num)) %>%
+  mutate(Month = factor(as.numeric(format(Date, format = '%m')),
+                                                levels = 1:12, 
+                                                labels = month.abb),
+         DOY = as.numeric(format(Date,format = '%j')),
+         season = factor(season, levels = c('Spring', 'Summer', 'Fall')),
+         is_sp_up = season == 'Spring' & Station == 1,
+         Yearf = factor(Year)) %>%
+  rename(Season = season,
+         Density = combined_density,
+         Temp = ave_temp_c,
+         Sal = ave_sal_psu,
+         Turb = sur_turb,
+         AvgTurb = ave_turb_ntu,
+         DOsat = ave_DO_Saturation,
+         Chl = ave_chl_microgperl,
+         Fish = `___61`,
+         RH = Herring
+         ) %>%
+  select(Date, Station, Year, Yearf, Month, Season, is_sp_up, DOY, riv_km, 
+         disch_wk, disch_day, disch_max,
+         Temp, Sal, Turb, AvgTurb, DOsat, Chl, 
+         Fish, RH, 
+         Density, H, SEI,
+         Acartia, Balanus, Eurytemora, Polychaete, Pseudocal, Temora) %>%
+  arrange(Date, Station)
+head(base_data)
+```
+
+```{r}
+rm(station_data)
+```
+
+## Complete Cases
+This drops only two samples, one for missing Zooplankton data, one for missing
+fish data.  We need this reduced data set to run The `step()` function. It
+makes little sense to try stepwise model selection if each time you add or 
+remove a variable, the sample you are studying changes.  Since fish is never an
+important predictor, we will want need to refit models after stepwise elimination
+to use the most complete possible data set.
+
+```{r}
+complete_data <- base_data %>%
+  select(Season, Station, Yearf,
+         is_sp_up, Temp, Sal, Turb, Chl, Fish, RH,
+         Density, H, 
+         Acartia, Balanus, Eurytemora, Polychaete, Pseudocal, Temora) %>%
+  filter(complete.cases(.))
+```
+
+## Reduced Data
+The low salinity spring samples are doing something rather different, and they
+complicate model fitting. Models are far better behaved if we exclude a few
+extreme samples.  These are low salinity low zooplankton samples.  We have two 
+complementary ways to specify which samples to omit, without just omitting
+"outliers". The first is to restrict modeling to "marine" samples over a certain
+salinity range, and the other is to omit spring upstream samples, which include 
+most of the problematic samples.  We eventually decided to go with the first.
+
+```{r}
+drop_low <- complete_data %>%
+  filter(Sal > 10)    # Pulls three samples, including one fall upstream sample
+                      # a fourth low salinity sample lacks zooplankton data
+```
+
+# Functions for Data Preparation
+I developed versions of these two functions in the "GAM Analysis Partials.Rmd" 
+notebook. See that notebook and the "Testing indirection.Rmd" notebook for more 
+of the logic involved.
+
+## Find Evenly Spaced Points
+This finds evenly spaced points along the range of a specified variable.
+```{r}
+find_stops <- function(.dat, .predictor, .nstops = 25) {
+  .predictor <- ensym(.predictor)
+  r <- range(.dat[[.predictor]])
+  stops = seq(r[1], r[2], length.out = .nstops)
+  return(stops)
+}
+```
+
+## Conduct The Analysis
+This calculates marginal means along one predictor variable in a model.  Much
+of the code complexity handles special cases where either the x or y variables
+are transformed, which changes the way parts of the output are named.
+```{r}
+marginal_analysis <- function(.dat, .predictor, .model, 
+                              .nstops = 25, .logx = TRUE, .transy = TRUE) {
+  .predictor <- ensym(.predictor)
+  
+  the_name <- as.character(.predictor)
+  the_log_name <- paste0("log(", the_name, ")")
+  
+  # The following finds stops linear in the original predictor scale.
+  # That is appropriate for the planned graphics, where both axes are 
+  # untransformed.
+  stops <- find_stops(.dat, !!.predictor, .nstops)
+  # browser()
+  if (.logx) {
+    stopslist <- list(log(stops))
+    names(stopslist) <- the_log_name
+    
+    emms <- emmeans(.model, the_log_name, 
+                    at = stopslist,
+                    type = 'response')
+    emms <- as_tibble(emms) 
+    #browser()
+    emms <- emms %>%
+      mutate( !!the_name := exp(emms[[the_log_name]]))
+  }
+  else {
+    #browser()
+    stopslist <- list(stops)
+    names(stopslist) <- the_name
+    
+    emms <- emmeans(.model, the_name, 
+                    at = stopslist,
+                    type = 'response')
+    emms <- as_tibble(emms)
+    
+  }
+  #The default name of the output of emmeans() differs if the response
+  #variable is transformed or untransformed. This makes names consistent.
+  if (! .transy) {
+    emms <-  emms %>%
+      rename(response = emmean)
+  }
+  return(emms)
+}
+```
+
+# Total Zooplankton Density
+I fit the simplified model without Station.  The full model has the same
+concurvity problems as before, and here the model fails to converge.  While I
+could alter the convergence criteria to search for a solution, we know the model
+that includes Station will have concurvity problems, so there is little point.
+
+## Reduced Complexity Model
+```{r}
+density_gam_reduced<- gam(log(Density) ~ 
+                          #s(Temp, bs="ts", k = 5) +
+                          #s(Sal, bs="ts", k = 5) + 
+                          s(log(Turb), bs="ts", k = 5) + 
+                          s(log(Chl), bs="ts", k = 5) + 
+                          #s(log1p(Fish),bs="ts", k = 5) +
+                          s(Yearf, bs = 're'), 
+                        data = drop_low, family = 'gaussian')
+summary(density_gam_reduced)
+
+```
+
+## Final Graphic
+### Generate Separate Marginal Means
+```{r}
+turb <- marginal_analysis(drop_low, Turb, density_gam_reduced, 
+                                  .nstops = 25, .logx = TRUE)
+chl <- marginal_analysis(drop_low, Chl, density_gam_reduced, 
+                                  .nstops = 25, .logx = TRUE)
+```
+
+### Name Match
+```{r}
+names(turb) <- c("log(Pred)", names(turb)[2:6], "Pred")
+names(chl) <- c("log(Pred)", names(chl)[2:6], "Pred")
+```
+
+```{r}
+emms <- bind_rows(Turbidity = turb, Chlorophyll = chl, .id = "source") 
+```
+
+`ggplot2` allows you to construct fancier labels by building up something like
+plotmath expressions.  The syntax is a bit obscure, and as far as I can tell,
+you can only test whether you got it right by plotting the expression.
+
+### Assemble Data
+```{r}
+fancy_turb <- expression("Turbidity" ~ "(NTU)")
+fancy_chl  <- expression("Chlorophyll ("* mu * g * L ^-1 ~")")
+fancy_dens <- expression("Zooplankton Density (" * m ^-3 ~ ")" )
+
+dat <- drop_low %>%
+  select(Turb, Chl, Density) %>%
+  pivot_longer(c(Turb, Chl), names_to = "source", values_to = "Pred") %>%
+  mutate(source = factor(source, 
+                         levels = c("Turb", "Chl"),
+                         labels = c(fancy_turb, fancy_chl)))
+
+emms <- bind_rows(Turbidity = turb, Chlorophyll = chl, .id = "source")  %>%
+  mutate(source = factor(source, 
+                         levels = c("Turbidity", "Chlorophyll"),
+                         labels = c(fancy_turb, fancy_chl)))
+```
+
+### Draw the Graphic
+```{r fig.width = 5, fig.height = 2.2}
+ggplot(emms, aes(Pred, response)) +   
+  geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
+  geom_line() +
+  geom_point(data = dat, mapping = aes(x = Pred, y = Density),
+             size = 1, color = "grey30") +
+  geom_rug(data = dat, mapping = aes(x = Pred, y = NULL)) +
+  facet_rep_wrap(~source, scales = "free_x", strip.position = "bottom",
+             labeller=label_parsed) +
+  
+  theme(axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8),
+        axis.title.x = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_text(size = 9),
+        panel.spacing.x = unit(-15,"pt")) +
+  ylab(fancy_dens)
+
+```
+
+### Save the Plot
+```{r}
+ggsave(file='figures/density_3.png',
+width = 5.04, height = 2.2)
+ggsave('figures/density_3.pdf', device = cairo_pdf,
+width = 5.04, height = 2.2)
+```
+
+# Shannon Diversity
+## Model on Reduced Data
+```{r}
+shannon_gam_no_low <- gam(H ~ 
+                     s(Temp, bs="ts", k = 5) +
+                     s(Sal, bs="ts", k = 5) + 
+                     s(log(Turb), bs="ts", k = 5) + 
+                     s(log(Chl), bs="ts", k = 5) + 
+                     s(log1p(Fish),bs="ts", k = 5) +
+                     s(Yearf, bs = 're'),
+                   data = drop_low, family = 'gaussian')
+summary(shannon_gam_no_low)
+```
+## Final Graphic
+### Generate Separate Marginal Means
+```{r}
+temp <- marginal_analysis(drop_low, Temp, shannon_gam_no_low, 
+                                  .nstops = 25, .logx = FALSE)
+chl <- marginal_analysis(drop_low, Chl, shannon_gam_no_low, 
+                                  .nstops = 25, .logx = TRUE, .transy = FALSE)
+```
+
+#### Name match
+```{r}
+names(temp) <- c("Pred", names(temp)[2:6])
+names(chl) <- c("log(Pred)", names(chl)[2:6], "Pred")
+chl <- chl[,c(7, 2:6)]
+```
+
+### Assemble data
+```{r}
+fancy_temp <- expression("Temperature (" * degree * "C)")
+fancy_chl  <- expression("Chlorophyll ("* mu * g * L ^-1 ~")")
+dat <- drop_low %>%
+  select(Temp, Chl, H) %>%
+  pivot_longer(c(Temp, Chl), names_to = "source", values_to = "Pred") %>%
+  mutate(source = factor(source, 
+                         levels = c("Temp", "Chl"),
+                         labels = c(fancy_temp, fancy_chl)))
+
+emms <- bind_rows(Temperature = temp, Chlorophyll = chl, .id = "source")  %>%
+  mutate(source = factor(source, 
+                         levels = c("Temperature", "Chlorophyll"),
+                         labels = c(fancy_temp, fancy_chl)))
+```
+
+### Generate Plot
+```{r fig.width = 5, fig.height = 2.5}
+ggplot(emms, aes(Pred, response)) +   
+  geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
+  geom_line() +
+  geom_point(data = dat, mapping = aes(x = Pred, y = H),
+             size = 1, color = "grey30") +
+  geom_rug(data = dat, mapping = aes(x = Pred, y = NULL)) +
+  facet_rep_wrap(~source, scales = "free_x", strip.position = "bottom",
+             labeller=label_parsed) +
+  
+  theme(axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8),
+        axis.title.x = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_text(size = 9),
+        panel.spacing.x = unit(0,"pt")) +
+  ylab("Diversity (H)")
+
+```
+
+###Save the Plot
+```{r}
+ggsave(file='figures/shannon_3.png',
+         width = 5, height = 2.2)
+ggsave('figures/shannon_3.pdf', device = cairo_pdf, 
+       width = 5, height = 2.2)
+```
+
+# Single Species Models
+## Model Choice
+Our model alternatives are similar to the choices we had for the Total Density 
+model. The problem is, we can't use any of the continuous data distributions in 
+GAMS with zero values (at least relying on the canonical link functions) because
+(log(0) = -Inf; 1/0 = Inf, 1 / 0*0 = Inf). The easiest solution is to add some 
+finite small quantity to the density data, and predict that. Here we predict
+log(Density + 1) using Gaussian models.
+
+## Automating Analysis of Separate Species
+I'm going to automate analysis of all selected species by using a "nested"
+Tibble.  This is a convenient alternative to writing a "for" loop to run
+multiple identical analyses.
+
+I create a "long" data source, based on the reduced data set that omits low
+salinity samples.
+
+```{r}
+spp_data <- drop_low %>%
+  select(Yearf, Season, Station, Temp,
+          Sal, Turb, Chl, Fish, 
+          Acartia, Balanus, Eurytemora) %>%
+  pivot_longer(-c(Yearf:Fish), names_to = 'Species', values_to = 'Density')
+```
+
+Next, I create a function to run the analysis.  This function takes a data frame
+or tibble as an argument.  The tibble mush have data columns with the correct 
+names.
+
+The initial model fits for some species had a lot of wiggles in them, to an 
+extent that I thought did not make much scientific sense, so I decided to reduce
+the dimensionality of the GAM smoothers, by adding the parameter `k= 4`. Lowe
+numbers constrain the GAM to fit smoother lines.
+
+```{r}
+my_gam <- function(.dat) {
+  
+  gam(log1p(Density) ~ 
+        s(Temp, bs="ts", k = 5) +
+        s(Sal, bs="ts", k = 5) + 
+        s(log(Turb), bs="ts", k = 5) + 
+        s(log(Chl), bs="ts", k = 5) + 
+        s(log1p(Fish),bs="ts", k = 5) +
+        s(Yearf, bs = 're'),
+      data = .dat, family = "gaussian")
+}
+```
+
+Next, I create the nested tibble, and conduct the analysis on each species....
+
+```{r}
+spp_analysis <- spp_data %>%
+  group_by(Species) %>%
+  nest() %>%
+  mutate(gam_mods = map(data, my_gam))
+```
+
+And finally, output the model results.  I can do that in a "for" loop, but it's 
+Awkward to look through a long list of output, so I step through each species in turn.
+
+## Acartia
+```{r}
+spp = 'Acartia'
+mod <- spp_analysis$gam_mods[spp_analysis$Species == spp][[1]]
+dat <- spp_analysis$data[spp_analysis$Species == spp][[1]]
+summary(mod)
+```
+
+### Final Graphic
+#### Generate Separate Marginal Means
+```{r}
+temp <- marginal_analysis(dat, Temp, mod, .logx = FALSE)
+```
+
+```{r}
+sal <- marginal_analysis(dat, Sal, mod, .logx = FALSE)
+```
+
+##### Name match
+```{r}
+names(temp) <- c("Pred", names(temp)[2:6])
+names(sal) <- c("Pred", names(sal)[2:6])
+```
+
+#### Assemble data
+```{r}
+fancy_temp <- expression("Temperature (" * degree * "C)")
+fancy_sal  <- expression("Salinity" ~ "(PSU)")
+
+dat <- dat %>%
+  select(Temp, Sal, Density) %>%
+  pivot_longer(c(Temp, Sal), names_to = "source", values_to = "Pred") %>%
+  mutate(source = factor(source, 
+                         levels = c("Temp", "Sal"),
+                         labels = c(fancy_temp, fancy_sal)))
+
+emms <- bind_rows(Temperature = temp, Salinity = sal, .id = "source")  %>%
+  mutate(source = factor(source, 
+                         levels = c("Temperature", "Salinity"),
+                         labels = c(fancy_temp, fancy_sal)))
+```
+
+#### Generate Plot
+```{r fig.width = 5, fig.height = 2.5}
+ggplot(emms, aes(Pred, response)) +   
+  geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
+  geom_line() +
+  geom_point(data = dat, mapping = aes(x = Pred, y = Density),
+             size = 1, color = "grey30") +
+  geom_rug(data = dat, mapping = aes(x = Pred, y = NULL)) +
+  facet_rep_wrap(~source, scales = "free_x", strip.position = "bottom",
+             labeller=label_parsed) +
+  
+  theme(axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8),
+        axis.title.x = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_text(size = 9),
+        panel.spacing.x = unit(-15,"pt")) +
+  ylab(expression("Acartia Density (" * m ^-3 ~ ")" )) +
+  scale_y_continuous(breaks = c(1:5*2500)) +
+  coord_cartesian(ylim = c(0, 12500))
+
+```
+
+# Save Plot
+```{r}
+ggsave(file='figures/Acartia_3.png', 
+         width = 5.04, height = 2.5)
+ggsave('figures/Acartia_3.pdf', device = cairo_pdf, 
+       width = 5.04, height = 2.5)
+```
+
+## Balanus
+```{r}
+spp = 'Balanus'
+mod <- spp_analysis$gam_mods[spp_analysis$Species == spp][[1]]
+dat <- spp_analysis$data[spp_analysis$Species == spp][[1]]
+summary(mod)
+```
+
+### Final Graphic
+#### Generate Separate Marginal Means
+```{r}
+temp <- marginal_analysis(dat, Temp, mod, .logx = FALSE)
+```
+
+```{r}
+chl <- marginal_analysis(dat, Chl, mod, .logx = TRUE)
+```
+
+##### Name match
+```{r}
+names(temp) <- c("Pred", names(temp)[2:6])
+names(chl) <- c("log(Pred)", names(chl)[2:6], "Pred")
+chl <- chl[,c(7, 2:6)]
+```
+
+#### Assemble data
+```{r}
+fancy_temp <- expression("Temperature (" * degree * "C)")
+fancy_chl  <- expression("Chlorophyll ("* mu * g * L ^-1 ~")")
+
+dat <- dat %>%
+  select(Temp, Chl, Density) %>%
+  pivot_longer(c(Temp, Chl), names_to = "source", values_to = "Pred") %>%
+  mutate(source = factor(source, 
+                         levels = c("Temp", "Chl"),
+                         labels = c(fancy_temp, fancy_chl)))
+
+emms <- bind_rows(Temperature = temp, Chlorophyll = chl, .id = "source")  %>%
+  mutate(source = factor(source, 
+                         levels = c("Temperature", "Chlorophyll"),
+                         labels = c(fancy_temp, fancy_chl)))
+```
+
+#### Generate Plot
+```{r fig.width = 5, fig.height = 2.5}
+ggplot(emms, aes(Pred, response)) +   
+  geom_ribbon(aes(ymin = lower.CL, ymax = upper.CL), fill = "grey80") +
+  geom_line() +
+  geom_point(data = dat, mapping = aes(x = Pred, y = Density),
+             size = 1, color = "grey30") +
+  geom_rug(data = dat, mapping = aes(x = Pred, y = NULL)) +
+  facet_rep_wrap(~source, scales = "free_x", strip.position = "bottom",
+             labeller=label_parsed) +
+  
+  theme(axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8),
+        axis.title.x = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_text(size = 9),
+        panel.spacing.x = unit(-15,"pt")) +
+  ylab(expression("Balanus Density (" * m ^-3 ~ ")" )) +
+  scale_y_continuous(breaks = c(1:4*500)) +
+  coord_cartesian(ylim = c(0, 2000))
+```
+
+#### Save Plot
+```{r}
+ggsave(file='figures/Balanus_3.png',
+         width = 5.04, height = 2.5)
+ggsave('figures/Balanus_3.pdf', device = cairo_pdf, 
+       width = 5.05, height = 2.5)
+```
+
